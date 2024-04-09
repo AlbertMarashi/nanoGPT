@@ -121,21 +121,29 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte_shared = nn.Embedding(config.vocab_size, config.n_embd),
+            wte_forward = nn.Embedding(config.vocab_size, config.n_embd),
+            wte_backward = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe_shared = nn.Embedding(config.block_size, config.n_embd),
+            wpe_backward = nn.Embedding(config.block_size, config.n_embd),
+            wpe_forward = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte_shared.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte_forward.weight = self.lm_head.weight
+        self.transformer.wte_backward.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -156,7 +164,9 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            n_params -= self.transformer.wpe_shared.weight.numel()
+            n_params -= self.transformer.wpe_backward.weight.numel()
+            n_params -= self.transformer.wpe_forward.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -167,16 +177,31 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    # Backwards is a boolean tensor of shape (b,) indicating whether to go backwards in time per batch element
+    def forward(self, idx, targets=None, backwards=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb_shared = self.transformer.wte_shared(idx) # shared token embeddings of shape (b, t, n_embd)
+        tok_emb_forward = self.transformer.wte_forward(idx)
+        tok_emb_backward = self.transformer.wte_backward(idx)
+
+        pos_emb_shared = self.transformer.wpe_shared(pos) / 2 # shared position embeddings of shape (t, n_embd)
+        pos_emb_forward = self.transformer.wpe_forward(pos) / 2 # position embeddings of shape (t, n_embd)
+        pos_emb_backward = self.transformer.wpe_backward(pos) / 2 # position embeddings of shape (t, n_embd)
+        if backwards is None:
+            backwards = torch.zeros(b, dtype=torch.bool, device=device)
+
+        # print(pos_emb_shared)
+
+        # if we are going backwards, we need to swap the position embeddings
+        pos_emb = torch.where(backwards[:, None, None], pos_emb_backward, pos_emb_forward)
+        tok_emb = torch.where(backwards[:, :, None], tok_emb_backward, tok_emb_forward)
+
+        x = self.transformer.drop(tok_emb + tok_emb_shared + pos_emb + pos_emb_shared)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,7 +223,9 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe_shared.weight = nn.Parameter(self.transformer.wpe_shared.weight[:block_size])
+        self.transformer.wpe_forward.weight = nn.Parameter(self.transformer.wpe_backward.weight[:block_size])
+        self.transformer.wpe_backward.weight = nn.Parameter(self.transformer.wpe_backward.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -303,7 +330,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, backwards = None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -313,7 +340,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, backwards=backwards)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

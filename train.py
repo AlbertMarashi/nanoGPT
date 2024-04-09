@@ -14,13 +14,24 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 - Run on the worker node:
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+
+$ python train.py config/train_shakespeare_char.py --device=mps --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
 """
+import csv  # Import at the beginning of the script
+
+# Add a new function to append data to CSV
+def append_to_csv(file_name, row_data):
+    with open(file_name, 'a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(row_data)
+
 
 import os
 import time
 import math
 import pickle
 from contextlib import nullcontext
+import random
 
 import numpy as np
 import torch
@@ -29,10 +40,19 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+BACKWARDS_DATA_PERCENT = 0.05
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
+# Add CSV file setup near the beginning, after model initialization
+csv_file_name = f"run-2-b128-{BACKWARDS_DATA_PERCENT*100:.0f}%.csv"
+csv_path = os.path.join(out_dir, csv_file_name)
+
+# write the header to the CSV file
+append_to_csv(csv_path, ["iter", "train_loss", "train_loss_forward_only", "train_loss_backward_only", "val_loss", "val_loss_forward_only", "val_loss_backward_only"])
+
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -113,22 +133,45 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+def get_batch(split, percent = BACKWARDS_DATA_PERCENT):
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    ix = torch.randint(0, len(data) - block_size - 1, (batch_size,))  # Ensure space for sequence + target
+
+    # Initialize x and y as lists to accumulate examples
+    x_list, y_list, backwards_list = [], [], []
+    for i in ix:
+        backwards = random.random() < percent  # Decide direction for each example
+        backwards_list.append(backwards)  # Store the direction flag
+
+        if backwards:
+            # In backwards mode, reverse the sequence for x and set the correct target for y
+            x = torch.from_numpy(data[i+1:i+block_size+1][::-1].astype(np.int64))
+            y = torch.from_numpy(data[i:i+block_size][::-1].astype(np.int64))
+        else:
+            # In forwards mode, keep the original sequence for x and the following token as y
+            x = torch.from_numpy(data[i:i+block_size].astype(np.int64))
+            y = torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64))
+        x_list.append(x)
+        y_list.append(y)
+
+    # Stack the list of tensors to create a batch
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
+
+    # Stack the list of backwards flags to create a tensor
+    backwards = torch.tensor(backwards_list, dtype=torch.bool)
+
+
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, y, backwards = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True), backwards.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x, y, backwards = x.to(device), y.to(device), backwards.to(device)
+
+    return x, y, backwards
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -145,7 +188,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+    bias=bias, vocab_size=None, dropout=dropout)
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -219,13 +263,45 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, backwards = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, backwards=backwards)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
+
+@torch.no_grad()
+def estimate_loss_forward_only():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y, backwards = get_batch(split, 0)
+            with ctx:
+                logits, loss = model(X, Y, backwards=backwards)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+@torch.no_grad()
+def estimate_loss_backward_only():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y, backwards = get_batch(split, 1)
+            with ctx:
+                logits, loss = model(X, Y, backwards=backwards)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -247,7 +323,8 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, backwards = get_batch('train') # fetch the very first batch
+
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -263,6 +340,22 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        losses_forward_only = estimate_loss_forward_only()
+        print(f"step {iter_num}: train loss (forward only) {losses_forward_only['train']:.4f}, val loss (forward only) {losses_forward_only['val']:.4f}")
+        losses_backward_only = estimate_loss_backward_only()
+        print(f"step {iter_num}: train loss (backward only) {losses_backward_only['train']:.4f}, val loss (backward only) {losses_backward_only['val']:.4f}")
+
+        append_to_csv(csv_path, [
+            iter_num,
+            losses['train'].item(),
+            losses_forward_only['train'].item(),
+            losses_backward_only['train'].item(),
+            losses['val'].item(),
+            losses_forward_only['val'].item(),
+            losses_backward_only['val'].item()
+        ])
+
+
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -297,10 +390,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, backwards=backwards)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y, backwards = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -325,6 +418,8 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        append_to_csv(csv_path, [iter_num, lossf])
     iter_num += 1
     local_iter_num += 1
 
