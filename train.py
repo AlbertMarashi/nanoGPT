@@ -144,8 +144,21 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    bias=bias,
+    vocab_size=None,
+    dropout=dropout,
+    max_thinking_steps=max_thinking_steps,  # Add this
+    thinking_budget_decay_rate=thinking_budget_decay_rate,  # Add this
+    budget_factor=budget_factor,  # Add this
+    target_usage=target_usage,  # Add this
+)
+
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -262,6 +275,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        print(f"Thinking budget threshold: {model.thinking_budget.threshold * 100:.2f}%")
+        print(f"Average thinking steps: {model.thinking_budget.avg_thinking_steps:.2f}")
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -324,6 +339,8 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        print(f"Thinking budget threshold: {model.thinking_budget.threshold * 100:.2f}%")
+        print(f"Average thinking steps: {model.thinking_budget.avg_thinking_steps:.2f}")
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1

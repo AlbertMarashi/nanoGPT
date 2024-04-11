@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+torch.autograd.set_detect_anomaly(True)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -114,6 +115,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    max_thinking_steps: int = 5
+    thinking_budget_decay_rate: float = 0.01
+    budget_factor: float = 0.01
+    target_usage: float = 0.5
 
 class GPT(nn.Module):
 
@@ -137,12 +142,24 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+
+        # The thinking block
+        self.thinking_block = Block(config)
+
+        # Compute the maximum entropy for normalizing entropy values
+        self.max_entropy = torch.log(torch.tensor(config.vocab_size)).item()
+        # Initialize the adaptive thinking budget
+        self.thinking_budget = AdaptiveThinkingBudget(
+            config.max_thinking_steps,
+        )
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -166,31 +183,6 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
-
-        return logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -328,3 +320,109 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+
+
+
+        logits = self.lm_head(self.transformer.ln_f(x))
+        confidence = self.compute_confidence(logits)
+        thinking_steps_counter = torch.zeros(b, t, device=device)
+        needs_update = torch.ones(b, t, dtype=torch.bool, device=device)
+        threshold = self.thinking_budget.threshold
+
+        for _ in range(self.config.max_thinking_steps):
+            current_x = self.thinking_block(x)
+            current_logits = self.lm_head(self.transformer.ln_f(current_x))
+            current_confidence = self.compute_confidence(current_logits)
+            improvement = (current_confidence - confidence) < threshold
+            # print(f"improvement shape: {improvement.shape}")
+            # print(f"confidence shape: {confidence.shape}")
+            # print(f"needs_update shape: {needs_update.shape}")
+            # needs_update = needs_update & improvement
+            needs_update = needs_update & improvement
+            needs_update_expanded = needs_update.unsqueeze(-1).expand_as(current_x)
+
+            # Update counters and states selectively based on improvement
+            thinking_steps_counter += needs_update.float()  # Increment counter where updates are applied
+            # Update x and logits selectively based on improvement
+            x = torch.where(needs_update_expanded, current_x, x)
+            logits = torch.where(needs_update.unsqueeze(-1), current_logits, logits)
+            if not needs_update.any():
+                break
+
+        # Update the thinking budget with the average number of thinking steps used
+        # per token in the batch
+        if self.training:
+            avg_thinking_steps = (thinking_steps_counter.sum() / ( b * t )).item()
+            self.thinking_budget.update(avg_thinking_steps)
+
+        if targets is not None:
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            # Compute the entropy of the predicted probabilities
+            probs = torch.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)
+
+            # Compute the mask for valid targets (exclude ignore_index)
+            target_mask = (targets != -1)
+
+            # Compute the average entropy only for valid targets
+            avg_entropy = (entropy * target_mask).sum() / target_mask.sum()
+
+            # Add the entropy regularization term to the cross-entropy loss
+            loss = ce_loss + 0.1 * avg_entropy
+
+            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            loss = None
+
+        return logits, loss
+
+    def compute_confidence(self, logits):
+        probs = torch.softmax(logits, dim=-1)  # Convert logits to probabilities using softmax
+        entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)  # Compute the entropy of the probabilities
+        normalized_entropy = entropy / self.max_entropy
+        confidence = 1 - normalized_entropy
+        return confidence
+    # def compute_confidence(self, logits):
+    #     probs = torch.softmax(logits, dim=-1)  # Convert logits to probabilities using softmax
+    #     # Compute the entropy of the probabilities for each token
+    #     entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)  # Add epsilon to avoid log(0)
+    #     # Normalize the entropy by the maximum possible entropy, without averaging across the batch
+    #     normalized_entropy = entropy / self.max_entropy
+    #     # Subtract normalized_entropy from 1 to get confidence scores for each token in the batch
+    #     confidence = 1 - normalized_entropy
+    #     return confidence
+
+class AdaptiveThinkingBudget:
+    # Constants for configuration
+    TARGET_USAGE = 0.5
+    INCREMENTAL_EFFECT = 0.0005  # Controls the incremental effect of new observations.
+    INFLUENCE = 0.01
+
+    def __init__(self, max_thinking_steps):
+        self.max_thinking_steps = max_thinking_steps
+        self.threshold = 0.0
+        self.avg_thinking_steps = 0.0
+
+    def update(self, num_thinking_steps):
+        self.avg_thinking_steps = self.avg_thinking_steps * (1 - self.INFLUENCE) + num_thinking_steps * self.INFLUENCE
+        proportion_used = num_thinking_steps / self.max_thinking_steps
+        usage_diff = self.TARGET_USAGE - proportion_used
+        # print(f'usage_diff: {usage_diff}')
+
+        self.threshold += self.INCREMENTAL_EFFECT * usage_diff
+        # Clamp the threshold to ensure it remains within reasonable bounds.
+        self.threshold = max(0.0, min(1.0, self.threshold))
