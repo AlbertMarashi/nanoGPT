@@ -1,3 +1,4 @@
+python train.py config/train_shakespeare_char.py
 
 # nanoGPT
 

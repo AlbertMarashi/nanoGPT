@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+torch.autograd.set_detect_anomaly(True)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -107,36 +108,19 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
         self.config = config
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        self.transformer = nn.ModuleDict({
+            'wte': nn.Embedding(config.vocab_size, config.n_embd),
+            'wpe': nn.Embedding(config.block_size, config.n_embd),
+            'drop': nn.Dropout(config.dropout),
+            'h': nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            'thinking': ThinkingBlock(config),  # The thinking block at the end
+            'ln_f': LayerNorm(config.n_embd, bias=config.bias)
+        })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # self.loss_head = nn.Linear(config.n_embd, 1)
-        self.loss_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 1
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 2
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, 1)  # Output layer
-        )
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
-        # init all weights
+        self.lm_head.weight = self.transformer.wte.weight  # Weight tying
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
@@ -166,6 +150,32 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
@@ -185,125 +195,25 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        pos = torch.arange(t, dtype=torch.long, device=device)
+        tok_emb = self.transformer.wte(idx)  # Token embeddings (batch, token, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # Position embeddings (token, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x, reg_loss = self.transformer.thinking(x)
 
+        # Get logits from the final layer normalization and linear transformation
+        logits = self.lm_head(self.transformer.ln_f(x))
+
+        # If targets are provided, compute loss
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            real_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
-            # Calculate the predicted loss
-            predicted_losses = self.loss_head(x).squeeze(-1)  # shape: (b, t)
-            # Compute the mean predicted loss
-            mean_predicted_loss = predicted_losses.mean()
-
-            # Compute the cross-entropy loss for each token
-            token_losses = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-            token_losses = token_losses.view(targets.size())
-
-            # # Create a dictionary to store the actual and predicted losses for each token
-            # token_loss_dict = {}
-            # for i in range(token_losses.size(1)):
-            #     actual_loss = token_losses[:, i].mean().item()
-            #     predicted_loss = predicted_losses[:, i].mean().item()
-            #     token_loss_dict[i] = {'actual': actual_loss, 'predicted': predicted_loss}
-
-            # # Print the token loss dictionary
-            # print("Token losses:")
-            # for token_idx, losses in token_loss_dict.items():
-            #     print(f"Token {token_idx}: Actual Loss: {losses['actual']:.4f}, Predicted Loss: {losses['predicted']:.4f}")
-            #     if token_idx == 8:
-            #         break
-
-            # print(predicted_losses)
-
-            # Compute the absolute difference between the predicted loss and the current lm_loss
-            loss_diff = torch.abs(mean_predicted_loss - real_loss.detach())
-
-            # Print the avg loss against the predicted loss
-            # print(f"loss diff: {loss_diff.item():5f}, avg loss: {real_loss.item():4f}, predicted loss: {mean_predicted_loss.item():4f}")
-
-            # Stack the predicted and actual losses together
-            stacked_losses = torch.stack((predicted_losses.view(-1), token_losses.view(-1)), dim=0)
-
-            # Compute the Pearson correlation coefficient
-            corr_coef = torch.corrcoef(stacked_losses)[0, 1]
-
-            corr_loss = -0.8 * corr_coef
-            loss_diff = loss_diff * 0.01
-            loss = real_loss + loss_diff + corr_loss
-
-            # Print the correlation coefficient
-            # print(f"act_loss: {loss.item():3f}, loss diff: {loss_diff.item():5f}, Corr loss: {corr_loss.item():.4f}, Corr Coef: {corr_coef.item():.4f}, Real Loss: {real_loss:.4f}, predicted loss: {mean_predicted_loss.item():4f}")
-
-
-            return logits, loss, predicted_losses, real_loss, corr_coef
+            total_loss = main_loss(logits, targets, 0)
+            # print(f"total loss: {total_loss}")
+            return logits, total_loss
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            return logits, None
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+            return logits  # For inference, only return logits
 
 class ThinkingBlock(nn.Module):
     MAX_ITER = 5
@@ -313,13 +223,6 @@ class ThinkingBlock(nn.Module):
         super().__init__()
         self.block = Block(config)
         self.energy_budget = nn.Parameter(torch.tensor(self.INTIAL_ENERGY_BUDGET))
-        self.loss_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 1
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 2
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, 1)  # Output layer
-        )
 
     def forward(self, x):
         B, T, C = x.shape
@@ -351,3 +254,105 @@ class ThinkingBlock(nn.Module):
             prev_entropy = entropy
 
         return x
+
+# class ThinkingBlock(nn.Module):
+#     MAX_ITER = 5
+#     INITIAL_THRESHOLD = 0.01
+#     LAMBDA_REG = 0.01
+#     TARGET_AVG_ITERATIONS = MAX_ITER / 2
+
+#     def __init__(self, config):
+#         super().__init__()
+#         self.block = Block(config)
+#         self.threshold = nn.Parameter(torch.tensor([self.INITIAL_THRESHOLD]))
+
+#     def forward(self, x):
+#         B, T, C = x.size()
+
+#         # Initialize variables
+#         iterations = torch.ones(B, T, dtype=torch.int32, device=x.device)
+#         total_improvement = 0.0
+#         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+
+#         # Iterate for a maximum number of iterations
+#         for i in range(self.MAX_ITER - 1):
+#             # Pass the input through the block
+#             x_new = self.block(x)
+
+#             # Calculate the improvement in token probabilities
+#             new_x_delta = x_new.softmax(dim=-1).max(dim=-1)[0]
+#             old_x_delta = x.softmax(dim=-1).max(dim=-1)[0]
+#             improvement = new_x_delta - old_x_delta
+#             total_improvement += improvement.mean().item()
+#             # print(f"improvement: {improvement.mean():.3f}")
+
+#             # If token predictions have increased in certainty
+#             update_mask = update_mask & (new_x_delta > old_x_delta)
+
+#             # Update the tokens that exceed the threshold
+#             x = torch.where(update_mask.unsqueeze(-1), x_new, x)
+
+#             # Increment the iteration count for updated tokens
+#             iterations += update_mask.int()
+
+#             # Check if all tokens have converged or reached the maximum iterations
+#             if update_mask.sum() == 0 or i == self.MAX_ITER - 1:
+#                 break
+
+#         avg_improvement = total_improvement / (i + 1)
+
+#         # print(f"avg improvement: {avg_improvement:.3f}")
+
+#         # Compute the average number of iterations
+#         avg_iterations = iterations.float().mean()
+
+#         # Calculate the deviation from the target average iterations
+#         iteration_deviation = self.TARGET_AVG_ITERATIONS - avg_iterations
+
+#         # Calculate the regularization term based on the iteration deviation
+#         regularization = self.LAMBDA_REG * iteration_deviation
+
+#         # print(f"avg iterations: {avg_iterations:.2f}, threshold: {self.threshold.item():.4f}, avgregularization: {regularization.item():.3f}")
+
+#         return x, regularization.mean()
+
+
+# class AdaptiveThinkingBudget:
+#     # Constants for configuration
+#     TARGET_USAGE = 0.5
+#     INCREMENTAL_EFFECT = 0.0005  # Controls the incremental effect of new observations.
+#     INFLUENCE = 0.01
+
+#     def __init__(self, max_thinking_steps):
+#         self.max_thinking_steps = max_thinking_steps
+#         self.threshold = 0.0
+#         self.avg_thinking_steps = 0.0
+
+#     def update(self, num_thinking_steps):
+#         self.avg_thinking_steps = self.avg_thinking_steps * (1 - self.INFLUENCE) + num_thinking_steps * self.INFLUENCE
+#         proportion_used = num_thinking_steps / self.max_thinking_steps
+#         usage_diff = self.TARGET_USAGE - proportion_used
+
+#         self.threshold += self.INCREMENTAL_EFFECT * usage_diff
+#         # Clamp the threshold to ensure it remains within reasonable bounds.
+#         self.threshold = max(0.0, min(1.0, self.threshold))
+
+def main_loss(logits, targets, reg_loss):
+    """
+    Compute the primary loss function (cross-entropy) for the predictions
+    and add regularization loss to enforce computational efficiency.
+
+    Args:
+        logits (torch.Tensor): The logits output by the model (batch size x sequence length x vocab size).
+        targets (torch.Tensor): The ground truth target indices (batch size x sequence length).
+        reg_loss (torch.Tensor): The regularization loss computed from the ThinkingBlock.
+
+    Returns:
+        torch.Tensor: The total loss combining both cross-entropy and regularization.
+    """
+    # Cross-entropy loss, assuming targets are class indices
+    predictive_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+    # Combine the predictive loss with the regularization loss
+    total_loss = predictive_loss + reg_loss
+    return total_loss

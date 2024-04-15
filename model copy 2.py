@@ -1,11 +1,3 @@
-import math
-import inspect
-from dataclasses import dataclass
-
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -122,41 +114,9 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # self.loss_head = nn.Linear(config.n_embd, 1)
-        self.loss_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 1
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 2
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, 1)  # Output layer
-        )
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
-        return n_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -165,22 +125,6 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -199,58 +143,13 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            real_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
-            # Calculate the predicted loss
-            predicted_losses = self.loss_head(x).squeeze(-1)  # shape: (b, t)
-            # Compute the mean predicted loss
-            mean_predicted_loss = predicted_losses.mean()
-
-            # Compute the cross-entropy loss for each token
-            token_losses = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-            token_losses = token_losses.view(targets.size())
-
-            # # Create a dictionary to store the actual and predicted losses for each token
-            # token_loss_dict = {}
-            # for i in range(token_losses.size(1)):
-            #     actual_loss = token_losses[:, i].mean().item()
-            #     predicted_loss = predicted_losses[:, i].mean().item()
-            #     token_loss_dict[i] = {'actual': actual_loss, 'predicted': predicted_loss}
-
-            # # Print the token loss dictionary
-            # print("Token losses:")
-            # for token_idx, losses in token_loss_dict.items():
-            #     print(f"Token {token_idx}: Actual Loss: {losses['actual']:.4f}, Predicted Loss: {losses['predicted']:.4f}")
-            #     if token_idx == 8:
-            #         break
-
-            # print(predicted_losses)
-
-            # Compute the absolute difference between the predicted loss and the current lm_loss
-            loss_diff = torch.abs(mean_predicted_loss - real_loss.detach())
-
-            # Print the avg loss against the predicted loss
-            # print(f"loss diff: {loss_diff.item():5f}, avg loss: {real_loss.item():4f}, predicted loss: {mean_predicted_loss.item():4f}")
-
-            # Stack the predicted and actual losses together
-            stacked_losses = torch.stack((predicted_losses.view(-1), token_losses.view(-1)), dim=0)
-
-            # Compute the Pearson correlation coefficient
-            corr_coef = torch.corrcoef(stacked_losses)[0, 1]
-
-            corr_loss = -0.8 * corr_coef
-            loss_diff = loss_diff * 0.01
-            loss = real_loss + loss_diff + corr_loss
-
-            # Print the correlation coefficient
-            # print(f"act_loss: {loss.item():3f}, loss diff: {loss_diff.item():5f}, Corr loss: {corr_loss.item():.4f}, Corr Coef: {corr_coef.item():.4f}, Real Loss: {real_loss:.4f}, predicted loss: {mean_predicted_loss.item():4f}")
-
-
-            return logits, loss, predicted_losses, real_loss, corr_coef
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            return logits, None
+            loss = None
+
+        return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -304,50 +203,3 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-class ThinkingBlock(nn.Module):
-    MAX_ITER = 5
-    INTIAL_ENERGY_BUDGET = 10.0
-    ENERGY_SCALE_FACTOR = 1.0
-    def __init__(self, config):
-        super().__init__()
-        self.block = Block(config)
-        self.energy_budget = nn.Parameter(torch.tensor(self.INTIAL_ENERGY_BUDGET))
-        self.loss_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 1
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 2
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, 1)  # Output layer
-        )
-
-    def forward(self, x):
-        B, T, C = x.shape
-        update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
-
-        for i in range(self.MAX_ITER):
-            # Compute the entropy of the current predictions
-            probs = F.softmax(x, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs), dim=-1)
-
-            if i > 0:
-                # Compute the energy based on entropy improvement
-                entropy_improvement = prev_entropy - entropy
-                energy = entropy_improvement * self.ENERGY_SCALE_FACTOR
-
-                # Select the top tokens within the energy budget
-                energy_budget = F.relu(self.energy_budget)  # Ensure non-negative budget
-                sorted_indices = torch.argsort(energy, descending=True)
-                cumulative_energy = torch.cumsum(energy[sorted_indices], dim=-1)
-                num_tokens_to_update = torch.sum(cumulative_energy <= energy_budget)
-                update_mask = torch.zeros_like(update_mask)
-                update_mask[sorted_indices[:num_tokens_to_update]] = True
-
-            # Apply the block(s) to the tokens that require further processing
-            x_to_update = x[update_mask]
-            x_updated = self.block(x_to_update)
-            x[update_mask] = x_updated
-
-            prev_entropy = entropy
-
-        return x
