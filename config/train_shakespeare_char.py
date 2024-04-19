@@ -33,3 +33,4 @@ beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 warmup_iters = 0 # not super necessary potentially
 
 device = "cpu"
+compile = False

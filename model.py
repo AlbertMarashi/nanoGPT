@@ -246,7 +246,7 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 6
+    MAX_ITER = 5
     AVG_THINKING_STEPS_TARGET = 3
     THRESHOLD_SENSITIVITY = 0.005
     LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
@@ -287,10 +287,9 @@ class ThinkingBlock(nn.Module):
         )
 
     def forward(self, x, targets):
-        x = self.expand(x)
-
-        B, T, C = x.shape
         self.step_count += 1
+        x = self.expand(x)
+        B, T, C = x.shape
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
         thinking_steps = torch.zeros(B, T, dtype=torch.long, device=x.device)
         improvement_amounts = torch.zeros(B, T, dtype=torch.float, device=x.device)
@@ -325,26 +324,6 @@ class ThinkingBlock(nn.Module):
                 accumulated_real_losses[update_mask] += real_losses_new[update_mask]
                 if i == 0:
                     initial_losses = real_losses_new
-            # if i > 0 and self.training and self.step_count % 50 == 0:
-            #     b = 0
-            #     total_actual_loss = 0.0
-            #     total_prev_loss = 0.0
-            #     num_tokens_updated = 0
-            #     for t in range(min(10, T)):
-            #         prev_difficulty = predicted_difficulties[b, t].item()
-            #         difficulty = new_difficulties[b, t].item()
-            #         actual_token_loss = real_losses_new[b, t].item()
-            #         prev_loss = prev_losses[b, t].item()
-            #         token_updated = update_mask[b, t].item()
-            #         if token_updated:
-            #             num_tokens_updated += 1
-            #             total_actual_loss += actual_token_loss
-            #             total_prev_loss += prev_loss
-            #             print(f"i: {i}, b: {b}, t: {t}, difficulty: {difficulty:.4f}, prev_loss: {prev_loss:.2f}, loss: {actual_token_loss:.2f}, loss_change: {prev_loss - actual_token_loss:.4f}")
-            #     total_improvement = total_prev_loss - total_actual_loss
-            #     avg_total_improvement = total_improvement / num_tokens_updated if num_tokens_updated > 0 else 0.0
-            #     print(f"i: {i}, avg_total_improvement: {avg_total_improvement:.4f}")
-            #     # print("==========================")
 
 
             # First, x[update_mask] returns a tensor of shape (num_tokens_updated, C)
@@ -358,15 +337,12 @@ class ThinkingBlock(nn.Module):
             initial_loss_total = initial_losses.sum()
             real_loss_total = real_losses.sum()
             loss_improvement = real_loss_total - initial_loss_total
-
             initial_loss = initial_loss_total / (B * T)
             real_loss = real_loss_total / (B * T)
             predicted_difficulty = predicted_difficulties.sum() / (B * T)
 
             avg_prediction_difficulties = accumulated_predicted_difficulties / thinking_steps
             avg_real_losses = accumulated_real_losses / thinking_steps
-
-            avg_loss_improvement = loss_improvement / (B * T)
 
             if self.training and self.step_count % 50 == 0:
                 print(f"initial_loss_total: {initial_loss_total.item():.0f}, real_loss_total: {real_loss_total.item():.0f}, avg_loss_improvement: {avg_loss_improvement:.4f}")
@@ -375,18 +351,6 @@ class ThinkingBlock(nn.Module):
                 usage_diff = avg_thinking_steps - self.AVG_THINKING_STEPS_TARGET
                 self.threshold.data += usage_diff * self.THRESHOLD_SENSITIVITY
 
-            # if self.training and self.step_count % 10 == 0:
-            #     # Compute the correlation coefficient between the average predicted loss and average real loss
-            #     print(
-            #         "accumulated_predicted_difficulties\n",
-            #         accumulated_predicted_difficulties,
-            #         "\naccumulated_real_losses\n",
-            #         accumulated_real_losses,
-            #         "\navg_predicted_difficulties\n",
-            #         accumulated_predicted_difficulties / thinking_steps,
-            #         "\navg_real_losses",
-            #         accumulated_real_losses / thinking_steps,
-            #     )
             stacked_losses = torch.stack(((accumulated_predicted_difficulties / thinking_steps).view(-1), (accumulated_real_losses / thinking_steps).view(-1)), dim=0)
             # stacked_losses = torch.stack((predicted_difficulties.view(-1), real_losses.view(-1)), dim=0)
             corr_coef = torch.corrcoef(stacked_losses)[0, 1]
@@ -411,3 +375,24 @@ class ThinkingBlock(nn.Module):
 
 
 
+
+            # if i > 0 and self.training and self.step_count % 50 == 0:
+            #     b = 0
+            #     total_actual_loss = 0.0
+            #     total_prev_loss = 0.0
+            #     num_tokens_updated = 0
+            #     for t in range(min(10, T)):
+            #         prev_difficulty = predicted_difficulties[b, t].item()
+            #         difficulty = new_difficulties[b, t].item()
+            #         actual_token_loss = real_losses_new[b, t].item()
+            #         prev_loss = prev_losses[b, t].item()
+            #         token_updated = update_mask[b, t].item()
+            #         if token_updated:
+            #             num_tokens_updated += 1
+            #             total_actual_loss += actual_token_loss
+            #             total_prev_loss += prev_loss
+            #             print(f"i: {i}, b: {b}, t: {t}, difficulty: {difficulty:.4f}, prev_loss: {prev_loss:.2f}, loss: {actual_token_loss:.2f}, loss_change: {prev_loss - actual_token_loss:.4f}")
+            #     total_improvement = total_prev_loss - total_actual_loss
+            #     avg_total_improvement = total_improvement / num_tokens_updated if num_tokens_updated > 0 else 0.0
+            #     print(f"i: {i}, avg_total_improvement: {avg_total_improvement:.4f}")
+            #     # print("==========================")
