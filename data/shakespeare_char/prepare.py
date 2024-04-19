@@ -8,17 +8,21 @@ import os
 import pickle
 import requests
 import numpy as np
+import csv
 
 # download the tiny shakespeare dataset
 input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
-if not os.path.exists(input_file_path):
-    data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(input_file_path, 'w') as f:
-        f.write(requests.get(data_url).text)
+# if not os.path.exists(input_file_path):
+#     data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+#     with open(input_file_path, 'w') as f:
+#         f.write(requests.get(data_url).text)
 
 with open(input_file_path, 'r') as f:
     data = f.read()
 print(f"length of dataset in characters: {len(data):,}")
+
+# replace all non-ascii characters with an empty string
+data = data.encode('ascii', 'ignore').decode('ascii')
 
 # get all the unique characters that occur in this text
 chars = sorted(list(set(data)))
@@ -59,10 +63,3 @@ meta = {
 }
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
-
-# length of dataset in characters:  1115394
-# all the unique characters:
-#  !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-# vocab size: 65
-# train has 1003854 tokens
-# val has 111540 tokens

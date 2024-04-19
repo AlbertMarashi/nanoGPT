@@ -246,15 +246,16 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 5
-    AVG_THINKING_STEPS_TARGET = 3
-    THRESHOLD_SENSITIVITY = 0.005
+    MAX_ITER = 1
+    AVG_THINKING_STEPS_TARGET = 1
+    THRESHOLD_SENSITIVITY = 0.0001
     LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
-    EMBED = 64
-    MIN_THINKING_STEPS = 2
+    # EMBED = 128
+    MIN_THINKING_STEPS = 1
 
     def __init__(self, config):
         super().__init__()
+        self.EMBED = config.n_embd
         new_config = GPTConfig(
             n_embd=self.EMBED,
             block_size=config.block_size,
@@ -292,27 +293,23 @@ class ThinkingBlock(nn.Module):
         B, T, C = x.shape
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
         thinking_steps = torch.zeros(B, T, dtype=torch.long, device=x.device)
-        improvement_amounts = torch.zeros(B, T, dtype=torch.float, device=x.device)
         predicted_difficulties = torch.zeros(B, T, dtype=torch.float, device=x.device)
         real_losses = torch.zeros(B, T, dtype=torch.float, device=x.device)
 
-        accumulated_predicted_difficulties = torch.zeros(B, T, dtype=torch.float, device=x.device)
-        accumulated_real_losses = torch.zeros(B, T, dtype=torch.float, device=x.device)
+        all_predicted_difficulties = []
+        all_real_losses = []
 
         for i in range(self.MAX_ITER):
-
             # Calculate the predicted losses
             new_difficulties = self.difficulty_head(x).squeeze(-1)  # shape: (B, T)
             # Update predicted_difficulties for only the tokens that are being updated
             predicted_difficulties[update_mask] = new_difficulties[update_mask]
-            accumulated_predicted_difficulties[update_mask] += predicted_difficulties[update_mask]
             # Compute the logits
             logits = self.to_logits(x)
 
             if i >= self.MIN_THINKING_STEPS:
                 # Determine which tokens should be updated based on the threshold
                 update_mask = update_mask & (predicted_difficulties > self.threshold)
-
             thinking_steps[update_mask] += 1
 
             if targets is not None:
@@ -321,9 +318,11 @@ class ThinkingBlock(nn.Module):
                 real_losses_new = real_losses_new.view(B, T)
                 prev_losses = real_losses.clone()
                 real_losses[update_mask] = real_losses_new[update_mask]
-                accumulated_real_losses[update_mask] += real_losses_new[update_mask]
                 if i == 0:
                     initial_losses = real_losses_new
+
+                all_predicted_difficulties.append(predicted_difficulties[update_mask].view(-1))
+                all_real_losses.append(real_losses_new[update_mask].view(-1))
 
 
             # First, x[update_mask] returns a tensor of shape (num_tokens_updated, C)
@@ -333,39 +332,34 @@ class ThinkingBlock(nn.Module):
             x[update_mask] = self.block(x[update_mask].view(1, -1, C)).view(-1, C)
 
         if targets is not None:
-            avg_thinking_steps = thinking_steps.sum().float() / (B * T)
+            thinking_steps = thinking_steps.sum()
+            avg_thinking_steps = thinking_steps / (B * T)
             initial_loss_total = initial_losses.sum()
             real_loss_total = real_losses.sum()
             loss_improvement = real_loss_total - initial_loss_total
-            initial_loss = initial_loss_total / (B * T)
-            real_loss = real_loss_total / (B * T)
-            predicted_difficulty = predicted_difficulties.sum() / (B * T)
 
-            avg_prediction_difficulties = accumulated_predicted_difficulties / thinking_steps
-            avg_real_losses = accumulated_real_losses / thinking_steps
+            real_loss = real_loss_total / (B * T)
 
             if self.training and self.step_count % 50 == 0:
-                print(f"initial_loss_total: {initial_loss_total.item():.0f}, real_loss_total: {real_loss_total.item():.0f}, avg_loss_improvement: {avg_loss_improvement:.4f}")
+                initial_loss = initial_loss_total / (B * T)
+                print(f"initial_loss_total: {initial_loss_total.item():.0f}, real_loss_total: {real_loss_total.item():.0f}")
 
             if self.training:
                 usage_diff = avg_thinking_steps - self.AVG_THINKING_STEPS_TARGET
                 self.threshold.data += usage_diff * self.THRESHOLD_SENSITIVITY
 
-            stacked_losses = torch.stack(((accumulated_predicted_difficulties / thinking_steps).view(-1), (accumulated_real_losses / thinking_steps).view(-1)), dim=0)
-            # stacked_losses = torch.stack((predicted_difficulties.view(-1), real_losses.view(-1)), dim=0)
+            stacked_losses = torch.stack((torch.cat(all_predicted_difficulties, dim=0), torch.cat(all_real_losses, dim=0)), dim=0)
             corr_coef = torch.corrcoef(stacked_losses)[0, 1]
-            # Regularisation strength hyperparameter
-            corr_loss = -1 * corr_coef
+            corr_loss = -0.1 * corr_coef
 
-            # loss = avg_real_losses.mean() + corr_loss
-            loss = real_loss + corr_loss
+            loss = real_loss# + corr_loss
             return {
                 "logits": logits,
                 "loss": loss,
                 "real_loss": real_loss,
-                "corr_coef": corr_coef,
+                "corr_coef": corr_coef.item(),
                 "avg_thinking_steps": avg_thinking_steps,
-                "predicted_difficulty": predicted_difficulty,
+                "predicted_difficulty": torch.cat(all_predicted_difficulties).sum() / thinking_steps,
                 "threshold": self.threshold.item(),
             }
         else:
