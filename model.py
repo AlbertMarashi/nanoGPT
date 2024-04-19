@@ -118,23 +118,10 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # self.loss_head = nn.Linear(config.n_embd, 1)
-        self.loss_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 1
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 2
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, 1)  # Output layer
-        )
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        self.thinking_block = ThinkingBlock(config)
 
         # init all weights
         self.apply(self._init_weights)
@@ -194,59 +181,10 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            real_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
-            # Calculate the predicted loss
-            predicted_losses = self.loss_head(x).squeeze(-1)  # shape: (b, t)
-            # Compute the mean predicted loss
-            mean_predicted_loss = predicted_losses.mean()
-
-            # Compute the cross-entropy loss for each token
-            token_losses = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-            token_losses = token_losses.view(targets.size())
-
-            # # Create a dictionary to store the actual and predicted losses for each token
-            # token_loss_dict = {}
-            # for i in range(token_losses.size(1)):
-            #     actual_loss = token_losses[:, i].mean().item()
-            #     predicted_loss = predicted_losses[:, i].mean().item()
-            #     token_loss_dict[i] = {'actual': actual_loss, 'predicted': predicted_loss}
-
-            # # Print the token loss dictionary
-            # print("Token losses:")
-            # for token_idx, losses in token_loss_dict.items():
-            #     print(f"Token {token_idx}: Actual Loss: {losses['actual']:.4f}, Predicted Loss: {losses['predicted']:.4f}")
-            #     if token_idx == 8:
-            #         break
-
-            # print(predicted_losses)
-
-            # Compute the absolute difference between the predicted loss and the current lm_loss
-            loss_diff = torch.abs(mean_predicted_loss - real_loss.detach())
-
-            # Print the avg loss against the predicted loss
-            # print(f"loss diff: {loss_diff.item():5f}, avg loss: {real_loss.item():4f}, predicted loss: {mean_predicted_loss.item():4f}")
-
-            # Stack the predicted and actual losses together
-            stacked_losses = torch.stack((predicted_losses.view(-1), token_losses.view(-1)), dim=0)
-
-            # Compute the Pearson correlation coefficient
-            corr_coef = torch.corrcoef(stacked_losses)[0, 1]
-
-            corr_loss = -0.8 * corr_coef
-            loss_diff = loss_diff * 0.01
-            loss = real_loss + loss_diff + corr_loss
-
-            # Print the correlation coefficient
-            # print(f"act_loss: {loss.item():3f}, loss diff: {loss_diff.item():5f}, Corr loss: {corr_loss.item():.4f}, Corr Coef: {corr_coef.item():.4f}, Real Loss: {real_loss:.4f}, predicted loss: {mean_predicted_loss.item():4f}")
-
-
-            return logits, loss, predicted_losses, real_loss, corr_coef
+            x, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, threshold = self.thinking_block(x, targets)
+            return x, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, threshold
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -306,48 +244,121 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 5
-    INTIAL_ENERGY_BUDGET = 10.0
-    ENERGY_SCALE_FACTOR = 1.0
+    MAX_ITER = 4
+    AVG_THINKING_STEPS_TARGET = 2
+    THRESHOLD_SENSITIVITY = 0.0002
+    LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
+
     def __init__(self, config):
         super().__init__()
         self.block = Block(config)
-        self.energy_budget = nn.Parameter(torch.tensor(self.INTIAL_ENERGY_BUDGET))
-        self.loss_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 1
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, config.n_embd),  # Hidden layer 2
-            nn.ReLU(),  # Activation function
-            nn.Linear(config.n_embd, 1)  # Output layer
+        self.iteration_count = 0
+        self.threshold = nn.Parameter(torch.tensor(0.0))
+        self.difficulty_head = nn.Sequential(
+            nn.LayerNorm(config.n_embd, bias=config.bias),
+            nn.Linear(config.n_embd, config.n_embd * 2),  # Hidden layer 1
+            nn.GELU(),  # Activation function
+            nn.Linear(config.n_embd * 2, config.n_embd),  # Hidden layer 2
+            nn.GELU(),  # Activation function
+            nn.Linear(config.n_embd, 1), # Output layer
         )
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, targets):
         B, T, C = x.shape
+        self.iteration_count += 1
+        # print(f"B: {B}, T: {T}, C: {C}")
+        # all tokens go through at least one thinking step
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+        # start at one because they all go through at least one thinking step
+        thinking_steps = torch.ones(B, T, dtype=torch.long, device=x.device)
+
+        predicted_difficulties = torch.zeros(B, T, dtype=torch.float, device=x.device)
+        real_losses = torch.zeros(B, T, dtype=torch.float, device=x.device)
 
         for i in range(self.MAX_ITER):
-            # Compute the entropy of the current predictions
-            probs = F.softmax(x, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs), dim=-1)
+            # normalize the x temp
+            normalised_x = self.ln_f(x)
+            # Calculate the predicted losses
+            new_difficulties = self.difficulty_head(normalised_x).squeeze(-1)  # shape: (B, T)
+            # Update predicted_difficulties for only the tokens that are being updated
+            predicted_difficulties[update_mask] = new_difficulties[update_mask]
+            # Compute the logits
+            logits = self.lm_head(normalised_x)
 
+            if targets is not None:
+                # Compute the real loss
+                real_losses_new = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
+                real_losses_new = real_losses_new.view(targets.size())
+
+                # Update real_losses for only the tokens that are being updated
+                real_losses[update_mask] = real_losses_new[update_mask]
             if i > 0:
-                # Compute the energy based on entropy improvement
-                entropy_improvement = prev_entropy - entropy
-                energy = entropy_improvement * self.ENERGY_SCALE_FACTOR
+                # Determine which tokens should be updated based on the threshold
+                update_mask = update_mask & (predicted_difficulties > self.threshold)
+                # Increment the thinking steps for the tokens that are being updated
+                thinking_steps[update_mask] += 1
 
-                # Select the top tokens within the energy budget
-                energy_budget = F.relu(self.energy_budget)  # Ensure non-negative budget
-                sorted_indices = torch.argsort(energy, descending=True)
-                cumulative_energy = torch.cumsum(energy[sorted_indices], dim=-1)
-                num_tokens_to_update = torch.sum(cumulative_energy <= energy_budget)
-                update_mask = torch.zeros_like(update_mask)
-                update_mask[sorted_indices[:num_tokens_to_update]] = True
+            if self.training and self.iteration_count % 50 == 0:
+                b = 0
+                for t in range(min(10, T)):
+                    prev_difficulty = predicted_difficulties[b, t].item()
+                    difficulty = new_difficulties[b, t].item()
+                    actual_token_loss = real_losses_new[b, t].item()
+                    prev_loss = real_losses[b, t].item()
+                    token_updated = update_mask[b, t].item()
+                    if token_updated:
+                        print(f"i: {i}, b: {b}, t: {t}, difficulty: {difficulty:.4f}, actual_loss: {actual_token_loss:.2f}, did_thinking: {token_updated}, loss_improvement: {prev_loss - actual_token_loss:.4f}")
+                print("==========================")
 
-            # Apply the block(s) to the tokens that require further processing
-            x_to_update = x[update_mask]
-            x_updated = self.block(x_to_update)
-            x[update_mask] = x_updated
+            x_updated = self.block(x.clone())
 
-            prev_entropy = entropy
+            # Update the original tensor with the updated tokens
+            x = torch.where(update_mask.unsqueeze(-1), x_updated, x)
 
-        return x
+        if targets is not None:
+            real_loss = real_losses.mean()
+            predicted_difficulty = predicted_difficulties.mean()
+            avg_thinking_steps = thinking_steps.float().mean()
+
+            stacked_losses = torch.stack((predicted_difficulties.view(-1), real_losses.view(-1)), dim=0)
+            # Compute the correlation coefficient between the average predicted loss and average real loss
+            corr_coef = torch.corrcoef(stacked_losses)[0, 1]
+
+            # Regularisation strength hyperparameter
+            corr_loss = -1 * corr_coef
+
+            if self.training:
+                usage_diff = avg_thinking_steps - self.AVG_THINKING_STEPS_TARGET
+                # print(f"usage_diff: {usage_diff:.2f}")
+                # adjust the threshold to move towards the target average number of thinking steps
+                self.threshold.data += usage_diff * self.THRESHOLD_SENSITIVITY
+
+            #Compute the absolute difference between the average predicted loss and average real loss
+            loss_diff = torch.abs(predicted_difficulty - real_loss)
+
+            # loss difference regularisation hyperparameter
+            loss_diff = loss_diff * self.LOSS_DIFF_SCALE
+
+            loss = real_loss + corr_loss# + loss_diff
+
+            # print(f"avg_thinking_steps: {avg_thinking_steps:.2f}, threshold: {self.threshold.item():.4f}, token_difficulty: {predicted_difficulty:.3f}, real_loss: {real_loss:.3f}, corr_coef: {corr_coef:.4f}")
+
+            return logits, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, self.threshold.item()
+        else:
+            return logits, None, None, None
+
+
+# import os
+# import pickle
+# from contextlib import nullcontext
+# import torch
+# # import tiktoken
+
+# with open(meta_path, 'rb') as f:
+#         meta = pickle.load(f)
+#     # TODO want to make this more general to arbitrary encoder/decoder schemes
+#     stoi, itos = meta['stoi'], meta['itos']
+#     encode = lambda s: [stoi[c] for c in s]
+#     decode = lambda l: ''.join([itos[i] for i in l])
