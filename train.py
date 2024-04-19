@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import json
 
 import numpy as np
 import torch
@@ -45,7 +46,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -69,7 +70,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'mps' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -231,9 +232,9 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, avg_real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, threshold = model(X, Y)
-            losses[k] = loss.item()
-            real_losses[k] = avg_real_loss.item()
+                data = model(X, Y)
+            losses[k] = data['loss'].item()
+            real_losses[k] = data['real_loss'].item()
         out[split] = losses.mean()
         out[f'{split}_real_loss'] = real_losses.mean()
     model.train()
@@ -264,6 +265,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -277,6 +279,13 @@ while True:
         # print(f"Thinking budget threshold: {model.thinking_budget.threshold * 100:.2f}%")
         # print(f"Average thinking steps: {model.thinking_budget.avg_thinking_steps:.2f}")
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train real loss {losses['train_real_loss']:.4f}, val real loss {losses['val_real_loss']:.4f}")
+        # print(json.dumps({
+        #     "step": iter_num,
+        #     "train_loss": f"{losses['train']:.4f}",
+        #     "val_loss": f"{losses['val']:.4f}",
+        #     "train_real_loss": f"{losses['train_real_loss']:.4f}",
+        #     "val_real_loss": f"{losses['val_real_loss']:.4f}",
+        # }, indent=None))
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -311,8 +320,8 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, threshold = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            data = model(X, Y)
+            loss = data["loss"] / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -338,7 +347,18 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, corr_coef {corr_coef:.4f}, real_loss {real_loss:.4f}, thinking_steps {avg_thinking_steps:.2f}, predicted_difficulty {predicted_difficulty:.3f}, threshold {threshold:.4f}")
+        # print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, corr_coef {corr_coef:.4f}, real_loss {real_loss:.4f}, thinking_steps {avg_thinking_steps:.2f}, predicted_difficulty {predicted_difficulty:.3f}, threshold {threshold:.4f}")
+        print(json.dumps({
+            "step": iter_num,
+            # "loss": f"{lossf:.4f}",
+            "time": f"{dt*1000:.2f}ms",
+            # "mfu": f"{running_mfu*100:.2f}%",
+            "corr_coef": f"{data['corr_coef']:.4f}",
+            "real_loss": f"{data['real_loss']:.4f}",
+            "thinking_steps": f"{data['avg_thinking_steps']:.2f}",
+            "predicted_difficulty": f"{data['predicted_difficulty']:.3f}",
+            "threshold": f"{data['threshold']:.4f}",
+        }, indent=None))
     iter_num += 1
     local_iter_num += 1
 

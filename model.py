@@ -1,10 +1,13 @@
 import math
 import inspect
+import json
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# torch.autograd.set_detect_anomaly(True)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -128,7 +131,7 @@ class GPT(nn.Module):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer + self.thinking_block.AVG_THINKING_STEPS_TARGET))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -179,12 +182,11 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        # for block in self.transformer.h:
+        #     x = block(x)
 
         if targets is not None:
-            x, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, threshold = self.thinking_block(x, targets)
-            return x, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, threshold
+            return self.thinking_block(x, targets)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -244,121 +246,168 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 4
-    AVG_THINKING_STEPS_TARGET = 2
-    THRESHOLD_SENSITIVITY = 0.0002
+    MAX_ITER = 6
+    AVG_THINKING_STEPS_TARGET = 3
+    THRESHOLD_SENSITIVITY = 0.005
     LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
+    EMBED = 64
+    MIN_THINKING_STEPS = 2
 
     def __init__(self, config):
         super().__init__()
-        self.block = Block(config)
-        self.iteration_count = 0
+        new_config = GPTConfig(
+            n_embd=self.EMBED,
+            block_size=config.block_size,
+            vocab_size=config.vocab_size,
+            n_layer=config.n_layer,
+            n_head=config.n_head,
+            dropout=config.dropout,
+            bias=config.bias,
+        )
+        self.block = Block(new_config)
+        self.step_count = 0
         self.threshold = nn.Parameter(torch.tensor(0.0))
         self.difficulty_head = nn.Sequential(
-            nn.LayerNorm(config.n_embd, bias=config.bias),
-            nn.Linear(config.n_embd, config.n_embd * 2),  # Hidden layer 1
+            nn.LayerNorm(self.EMBED, bias=config.bias),
+            nn.Linear(self.EMBED, self.EMBED * 2),  # Hidden layer 1
             nn.GELU(),  # Activation function
-            nn.Linear(config.n_embd * 2, config.n_embd),  # Hidden layer 2
-            nn.GELU(),  # Activation function
-            nn.Linear(config.n_embd, 1), # Output layer
+            # nn.Linear(self.EMBED * 2, self.EMBED),  # Hidden layer 2
+            # nn.GELU(),  # Activation function
+            nn.Linear(self.EMBED * 2, 1), # Output layer
         )
-        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.expand = nn.Sequential(
+            nn.LayerNorm(config.n_embd, bias=config.bias),
+            nn.Linear(config.n_embd, self.EMBED)
+        )
+        # self.expand = nn.Linear(config.n_embd, self.EMBED)
+        self.to_logits = nn.Sequential(
+            nn.LayerNorm(self.EMBED, bias=config.bias),
+            nn.Linear(self.EMBED, config.vocab_size, bias=False),
+            nn.LayerNorm(config.vocab_size, bias=config.bias),
+        )
 
     def forward(self, x, targets):
-        B, T, C = x.shape
-        self.iteration_count += 1
-        # print(f"B: {B}, T: {T}, C: {C}")
-        # all tokens go through at least one thinking step
-        update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
-        # start at one because they all go through at least one thinking step
-        thinking_steps = torch.ones(B, T, dtype=torch.long, device=x.device)
+        x = self.expand(x)
 
+        B, T, C = x.shape
+        self.step_count += 1
+        update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+        thinking_steps = torch.zeros(B, T, dtype=torch.long, device=x.device)
+        improvement_amounts = torch.zeros(B, T, dtype=torch.float, device=x.device)
         predicted_difficulties = torch.zeros(B, T, dtype=torch.float, device=x.device)
         real_losses = torch.zeros(B, T, dtype=torch.float, device=x.device)
 
+        accumulated_predicted_difficulties = torch.zeros(B, T, dtype=torch.float, device=x.device)
+        accumulated_real_losses = torch.zeros(B, T, dtype=torch.float, device=x.device)
+
         for i in range(self.MAX_ITER):
-            # normalize the x temp
-            normalised_x = self.ln_f(x)
+
             # Calculate the predicted losses
-            new_difficulties = self.difficulty_head(normalised_x).squeeze(-1)  # shape: (B, T)
+            new_difficulties = self.difficulty_head(x).squeeze(-1)  # shape: (B, T)
             # Update predicted_difficulties for only the tokens that are being updated
             predicted_difficulties[update_mask] = new_difficulties[update_mask]
+            accumulated_predicted_difficulties[update_mask] += predicted_difficulties[update_mask]
             # Compute the logits
-            logits = self.lm_head(normalised_x)
+            logits = self.to_logits(x)
+
+            if i >= self.MIN_THINKING_STEPS:
+                # Determine which tokens should be updated based on the threshold
+                update_mask = update_mask & (predicted_difficulties > self.threshold)
+
+            thinking_steps[update_mask] += 1
 
             if targets is not None:
                 # Compute the real loss
                 real_losses_new = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-                real_losses_new = real_losses_new.view(targets.size())
-
-                # Update real_losses for only the tokens that are being updated
+                real_losses_new = real_losses_new.view(B, T)
+                prev_losses = real_losses.clone()
                 real_losses[update_mask] = real_losses_new[update_mask]
-            if i > 0:
-                # Determine which tokens should be updated based on the threshold
-                update_mask = update_mask & (predicted_difficulties > self.threshold)
-                # Increment the thinking steps for the tokens that are being updated
-                thinking_steps[update_mask] += 1
+                accumulated_real_losses[update_mask] += real_losses_new[update_mask]
+                if i == 0:
+                    initial_losses = real_losses_new
+            # if i > 0 and self.training and self.step_count % 50 == 0:
+            #     b = 0
+            #     total_actual_loss = 0.0
+            #     total_prev_loss = 0.0
+            #     num_tokens_updated = 0
+            #     for t in range(min(10, T)):
+            #         prev_difficulty = predicted_difficulties[b, t].item()
+            #         difficulty = new_difficulties[b, t].item()
+            #         actual_token_loss = real_losses_new[b, t].item()
+            #         prev_loss = prev_losses[b, t].item()
+            #         token_updated = update_mask[b, t].item()
+            #         if token_updated:
+            #             num_tokens_updated += 1
+            #             total_actual_loss += actual_token_loss
+            #             total_prev_loss += prev_loss
+            #             print(f"i: {i}, b: {b}, t: {t}, difficulty: {difficulty:.4f}, prev_loss: {prev_loss:.2f}, loss: {actual_token_loss:.2f}, loss_change: {prev_loss - actual_token_loss:.4f}")
+            #     total_improvement = total_prev_loss - total_actual_loss
+            #     avg_total_improvement = total_improvement / num_tokens_updated if num_tokens_updated > 0 else 0.0
+            #     print(f"i: {i}, avg_total_improvement: {avg_total_improvement:.4f}")
+            #     # print("==========================")
 
-            if self.training and self.iteration_count % 50 == 0:
-                b = 0
-                for t in range(min(10, T)):
-                    prev_difficulty = predicted_difficulties[b, t].item()
-                    difficulty = new_difficulties[b, t].item()
-                    actual_token_loss = real_losses_new[b, t].item()
-                    prev_loss = real_losses[b, t].item()
-                    token_updated = update_mask[b, t].item()
-                    if token_updated:
-                        print(f"i: {i}, b: {b}, t: {t}, difficulty: {difficulty:.4f}, actual_loss: {actual_token_loss:.2f}, did_thinking: {token_updated}, loss_improvement: {prev_loss - actual_token_loss:.4f}")
-                print("==========================")
 
-            x_updated = self.block(x.clone())
-
-            # Update the original tensor with the updated tokens
-            x = torch.where(update_mask.unsqueeze(-1), x_updated, x)
+            # First, x[update_mask] returns a tensor of shape (num_tokens_updated, C)
+            # Then we must turn it into a tensor of shape (1, num_tokens_updated, C) so it works with the block
+            # After, we resize it back to (num_tokens_updated, C) and assign it to x[update_mask]
+            x = x.clone()
+            x[update_mask] = self.block(x[update_mask].view(1, -1, C)).view(-1, C)
 
         if targets is not None:
-            real_loss = real_losses.mean()
-            predicted_difficulty = predicted_difficulties.mean()
-            avg_thinking_steps = thinking_steps.float().mean()
+            avg_thinking_steps = thinking_steps.sum().float() / (B * T)
+            initial_loss_total = initial_losses.sum()
+            real_loss_total = real_losses.sum()
+            loss_improvement = real_loss_total - initial_loss_total
 
-            stacked_losses = torch.stack((predicted_difficulties.view(-1), real_losses.view(-1)), dim=0)
-            # Compute the correlation coefficient between the average predicted loss and average real loss
-            corr_coef = torch.corrcoef(stacked_losses)[0, 1]
+            initial_loss = initial_loss_total / (B * T)
+            real_loss = real_loss_total / (B * T)
+            predicted_difficulty = predicted_difficulties.sum() / (B * T)
 
-            # Regularisation strength hyperparameter
-            corr_loss = -1 * corr_coef
+            avg_prediction_difficulties = accumulated_predicted_difficulties / thinking_steps
+            avg_real_losses = accumulated_real_losses / thinking_steps
+
+            avg_loss_improvement = loss_improvement / (B * T)
+
+            if self.training and self.step_count % 50 == 0:
+                print(f"initial_loss_total: {initial_loss_total.item():.0f}, real_loss_total: {real_loss_total.item():.0f}, avg_loss_improvement: {avg_loss_improvement:.4f}")
 
             if self.training:
                 usage_diff = avg_thinking_steps - self.AVG_THINKING_STEPS_TARGET
-                # print(f"usage_diff: {usage_diff:.2f}")
-                # adjust the threshold to move towards the target average number of thinking steps
                 self.threshold.data += usage_diff * self.THRESHOLD_SENSITIVITY
 
-            #Compute the absolute difference between the average predicted loss and average real loss
-            loss_diff = torch.abs(predicted_difficulty - real_loss)
+            # if self.training and self.step_count % 10 == 0:
+            #     # Compute the correlation coefficient between the average predicted loss and average real loss
+            #     print(
+            #         "accumulated_predicted_difficulties\n",
+            #         accumulated_predicted_difficulties,
+            #         "\naccumulated_real_losses\n",
+            #         accumulated_real_losses,
+            #         "\navg_predicted_difficulties\n",
+            #         accumulated_predicted_difficulties / thinking_steps,
+            #         "\navg_real_losses",
+            #         accumulated_real_losses / thinking_steps,
+            #     )
+            stacked_losses = torch.stack(((accumulated_predicted_difficulties / thinking_steps).view(-1), (accumulated_real_losses / thinking_steps).view(-1)), dim=0)
+            # stacked_losses = torch.stack((predicted_difficulties.view(-1), real_losses.view(-1)), dim=0)
+            corr_coef = torch.corrcoef(stacked_losses)[0, 1]
+            # Regularisation strength hyperparameter
+            corr_loss = -1 * corr_coef
 
-            # loss difference regularisation hyperparameter
-            loss_diff = loss_diff * self.LOSS_DIFF_SCALE
-
-            loss = real_loss + corr_loss# + loss_diff
-
-            # print(f"avg_thinking_steps: {avg_thinking_steps:.2f}, threshold: {self.threshold.item():.4f}, token_difficulty: {predicted_difficulty:.3f}, real_loss: {real_loss:.3f}, corr_coef: {corr_coef:.4f}")
-
-            return logits, loss, real_loss, corr_coef, avg_thinking_steps, predicted_difficulty, self.threshold.item()
+            # loss = avg_real_losses.mean() + corr_loss
+            loss = real_loss + corr_loss
+            return {
+                "logits": logits,
+                "loss": loss,
+                "real_loss": real_loss,
+                "corr_coef": corr_coef,
+                "avg_thinking_steps": avg_thinking_steps,
+                "predicted_difficulty": predicted_difficulty,
+                "threshold": self.threshold.item(),
+            }
         else:
-            return logits, None, None, None
+            return {
+                "logits": logits,
+            }
 
 
-# import os
-# import pickle
-# from contextlib import nullcontext
-# import torch
-# # import tiktoken
 
-# with open(meta_path, 'rb') as f:
-#         meta = pickle.load(f)
-#     # TODO want to make this more general to arbitrary encoder/decoder schemes
-#     stoi, itos = meta['stoi'], meta['itos']
-#     encode = lambda s: [stoi[c] for c in s]
-#     decode = lambda l: ''.join([itos[i] for i in l])
