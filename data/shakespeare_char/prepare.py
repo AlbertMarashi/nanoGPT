@@ -20,6 +20,14 @@ with open(input_file_path, 'r') as f:
     data = f.read()
 print(f"length of dataset in characters: {len(data):,}")
 
+# remove all the non-ascii characters
+data = data.encode('ascii', 'ignore').decode('ascii')
+
+# get the first 10m characters
+data = data[:10000000]
+
+print(f"length of dataset in characters: {len(data):,}")
+
 # get all the unique characters that occur in this text
 chars = sorted(list(set(data)))
 vocab_size = len(chars)
