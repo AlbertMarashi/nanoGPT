@@ -23,8 +23,8 @@ print(f"length of dataset in characters: {len(data):,}")
 # remove all the non-ascii characters
 data = data.encode('ascii', 'ignore').decode('ascii')
 
-# get the first 10m characters
-data = data[:10000000]
+# get the first 5m characters
+data = data[:5000000]
 
 print(f"length of dataset in characters: {len(data):,}")
 
