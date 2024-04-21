@@ -91,12 +91,12 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        # self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        # self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -247,12 +247,12 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 1
-    AVG_THINKING_STEPS_TARGET = 1
+    MAX_ITER = 4
+    AVG_THINKING_STEPS_TARGET = 4
     THRESHOLD_SENSITIVITY = 0.0001
-    LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
+    # LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
     # EMBED = 128
-    MIN_THINKING_STEPS = 1
+    MIN_THINKING_STEPS = 4
 
     def __init__(self, config):
         super().__init__()
@@ -270,11 +270,11 @@ class ThinkingBlock(nn.Module):
         self.step_count = 0
         self.threshold = nn.Parameter(torch.tensor(0.0))
         self.difficulty_head = nn.Sequential(
-            nn.LayerNorm(self.EMBED, bias=config.bias),
+            # nn.LayerNorm(self.EMBED, bias=config.bias),
             nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 1
-            nn.GELU(),  # Activation function
-            nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 2
-            nn.GELU(),  # Activation function
+            # nn.GELU(),  # Activation function
+            # nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 2
+            # nn.GELU(),  # Activation function
             nn.Linear(self.EMBED, 1), # Output layer
         )
         self.expand = nn.Sequential(
@@ -353,7 +353,7 @@ class ThinkingBlock(nn.Module):
             corr_coef = torch.corrcoef(stacked_losses)[0, 1]
             corr_loss = -0.1 * corr_coef
 
-            loss = real_loss# + corr_loss
+            loss = real_loss + corr_loss
             return {
                 "logits": logits,
                 "loss": loss,
