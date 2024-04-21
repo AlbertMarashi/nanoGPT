@@ -24,6 +24,13 @@ print(f"length of dataset in characters: {len(data):,}")
 # replace all non-ascii characters with an empty string
 data = data.encode('ascii', 'ignore').decode('ascii')
 
+# get the first 5m characters
+data = data[:5000000]
+
+# trim any consecutive whitespace, by splitting into new lines and removing empty lines
+# data = '\n'.join([line.strip() for line in data.split('\n') if line.strip()])
+
+
 # get all the unique characters that occur in this text
 chars = sorted(list(set(data)))
 vocab_size = len(chars)

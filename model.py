@@ -91,12 +91,12 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        # self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        # self.mlp = MLP(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        # x = x + self.mlp(self.ln_2(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -120,8 +120,8 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            # drop = nn.Dropout(config.dropout),
-            # h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         ))
 
         self.thinking_block = ThinkingBlock(config)
@@ -182,7 +182,7 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = tok_emb + pos_emb
-        # x = self.transformer.drop(tok_emb + pos_emb)
+        # x = self.transformer.drop(x)
         # for block in self.transformer.h:
         #     x = block(x)
 
@@ -247,16 +247,16 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 4
-    AVG_THINKING_STEPS_TARGET = 4
-    THRESHOLD_SENSITIVITY = 0.0001
+    MAX_ITER = 1
+    AVG_THINKING_STEPS_TARGET = 1
+    THRESHOLD_SENSITIVITY = 0.0005
     # LOSS_DIFF_SCALE = THRESHOLD_SENSITIVITY
-    # EMBED = 128
-    MIN_THINKING_STEPS = 4
+    EMBED = 128
+    MIN_THINKING_STEPS = 1
 
     def __init__(self, config):
         super().__init__()
-        self.EMBED = config.n_embd
+        # self.EMBED = config.n_embd
         new_config = GPTConfig(
             n_embd=self.EMBED,
             block_size=config.block_size,
@@ -272,25 +272,16 @@ class ThinkingBlock(nn.Module):
         self.difficulty_head = nn.Sequential(
             # nn.LayerNorm(self.EMBED, bias=config.bias),
             nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 1
-            # nn.GELU(),  # Activation function
-            # nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 2
-            # nn.GELU(),  # Activation function
             nn.Linear(self.EMBED, 1), # Output layer
         )
-        self.expand = nn.Sequential(
-            nn.LayerNorm(config.n_embd, bias=config.bias),
-            nn.Linear(config.n_embd, self.EMBED)
-        )
-        # self.expand = nn.Linear(config.n_embd, self.EMBED)
         self.to_logits = nn.Sequential(
-            nn.LayerNorm(self.EMBED, bias=config.bias),
+            # nn.LayerNorm(self.EMBED, bias=config.bias),
             nn.Linear(self.EMBED, config.vocab_size, bias=False),
             nn.LayerNorm(config.vocab_size, bias=config.bias),
         )
 
     def forward(self, x, targets):
         self.step_count += 1
-        x = self.expand(x)
         B, T, C = x.shape
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
         thinking_steps = torch.zeros(B, T, dtype=torch.long, device=x.device)
@@ -301,49 +292,42 @@ class ThinkingBlock(nn.Module):
         all_real_losses = []
 
         for i in range(self.MAX_ITER):
-            # Calculate the predicted losses
-            new_difficulties = self.difficulty_head(x).squeeze(-1)  # shape: (B, T)
-            # Update predicted_difficulties for only the tokens that are being updated
-            predicted_difficulties[update_mask] = new_difficulties[update_mask]
+            thinking_steps[update_mask] += 1
+            # update the x tensor with the updated tokens
+            x = torch.where(update_mask.unsqueeze(-1), self.block(x), x)
+            # Calculate the predicted losses, only for the tokens that are being updated
+            predicted_difficulties[update_mask] = self.difficulty_head(x).squeeze(-1)[update_mask]
             # Compute the logits
             logits = self.to_logits(x)
 
-            if i >= self.MIN_THINKING_STEPS:
-                # Determine which tokens should be updated based on the threshold
-                update_mask = update_mask & (predicted_difficulties > self.threshold)
-            thinking_steps[update_mask] += 1
-
             if targets is not None:
                 # Compute the real loss
-                real_losses_new = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-                real_losses_new = real_losses_new.view(B, T)
-                prev_losses = real_losses.clone()
-                real_losses[update_mask] = real_losses_new[update_mask]
+                new_losses = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
+                # real_losses[update_mask] = new_losses[update_mask]
+                real_losses = torch.where(update_mask, new_losses, real_losses)
                 if i == 0:
-                    initial_losses = real_losses_new
+                    # initial_losses = real_losses.clone()
+                    initial_losses = new_losses
 
                 all_predicted_difficulties.append(predicted_difficulties[update_mask].view(-1))
-                all_real_losses.append(real_losses_new[update_mask].view(-1))
+                all_real_losses.append(real_losses[update_mask].view(-1))
 
-
-            # First, x[update_mask] returns a tensor of shape (num_tokens_updated, C)
-            # Then we must turn it into a tensor of shape (1, num_tokens_updated, C) so it works with the block
-            # After, we resize it back to (num_tokens_updated, C) and assign it to x[update_mask]
-            x = x.clone()
-            x[update_mask] = self.block(x[update_mask].view(1, -1, C)).view(-1, C)
+            if i >= self.MIN_THINKING_STEPS - 1:
+                # Determine which tokens should be updated next based on the threshold
+                update_mask = update_mask & (predicted_difficulties > self.threshold)
 
         if targets is not None:
             thinking_steps = thinking_steps.sum()
             avg_thinking_steps = thinking_steps / (B * T)
-            initial_loss_total = initial_losses.sum()
-            real_loss_total = real_losses.sum()
-            loss_improvement = real_loss_total - initial_loss_total
+            initial_loss = initial_losses.mean()
+            real_loss = real_losses.mean()
+            # loss_improvement = real_loss_total - initial_loss_total
+            # real_loss_total = real_losses.sum()
 
-            real_loss = real_loss_total / (B * T)
 
-            if self.training and self.step_count % 50 == 0:
-                initial_loss = initial_loss_total / (B * T)
-                print(f"initial_loss_total: {initial_loss_total.item():.0f}, real_loss_total: {real_loss_total.item():.0f}")
+            # if self.training and self.step_count % 50 == 0:
+            #     initial_loss = initial_loss_total / (B * T)
+            #     print(f"initial_loss_total: {initial_loss_total.item():.0f}, real_loss_total: {real_loss_total.item():.0f}")
 
             if self.training:
                 usage_diff = avg_thinking_steps - self.AVG_THINKING_STEPS_TARGET
@@ -353,20 +337,24 @@ class ThinkingBlock(nn.Module):
             corr_coef = torch.corrcoef(stacked_losses)[0, 1]
             corr_loss = -0.1 * corr_coef
 
-            loss = real_loss + corr_loss
-            return {
-                "logits": logits,
-                "loss": loss,
-                "real_loss": real_loss,
-                "corr_coef": corr_coef.item(),
-                "avg_thinking_steps": avg_thinking_steps,
-                "predicted_difficulty": torch.cat(all_predicted_difficulties).sum() / thinking_steps,
-                "threshold": self.threshold.item(),
-            }
+            # loss = (torch.cat(all_real_losses).sum() / (B * T) / thinking_steps) + corr_loss
+
+
+            loss = real_loss + corr_loss + initial_loss
+            # loss = real_loss + corr_loss + initial_loss_total
+            if self.training and self.step_count % 10 == 0:
+                print(json.dumps({
+                    "step": self.step_count,
+                    "loss": f"{loss.item():.4f}",
+                    "real_loss": f"{real_loss.item():.4f}",
+                    "corr_coef": f"{corr_coef.item():.4f}",
+                    "avg_thinking_steps": f"{avg_thinking_steps.item():.2f}",
+                    "predicted_difficulty": f"{torch.cat(all_predicted_difficulties).sum().item() / thinking_steps:.3f}",
+                    "threshold": f"{self.threshold.item():.4f}",
+                }))
+            return logits, loss
         else:
-            return {
-                "logits": logits,
-            }
+            return logits, None
 
 
 
