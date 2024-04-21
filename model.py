@@ -128,6 +128,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            thinking_block = Block(config),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -177,9 +178,10 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for i in range(4):
-            for block in self.transformer.h:
-                x = block(x)
+        for block in self.transformer.h:
+            x = block(x)
+        for i in range(3):
+            x = self.transformer.thinking_block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
