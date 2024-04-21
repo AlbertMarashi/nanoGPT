@@ -20,8 +20,8 @@ block_size = 256
 
 # baby GPT model :)
 n_layer = 0
-n_head = 2
-n_embd = 6
+n_head = 1
+n_embd = 8
 dropout = 0.0
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
