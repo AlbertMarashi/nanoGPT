@@ -120,8 +120,8 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+            # drop = nn.Dropout(config.dropout),
+            # h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         ))
 
         self.thinking_block = ThinkingBlock(config)
@@ -181,7 +181,8 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = tok_emb + pos_emb
+        # x = self.transformer.drop(tok_emb + pos_emb)
         # for block in self.transformer.h:
         #     x = block(x)
 
@@ -270,11 +271,11 @@ class ThinkingBlock(nn.Module):
         self.threshold = nn.Parameter(torch.tensor(0.0))
         self.difficulty_head = nn.Sequential(
             nn.LayerNorm(self.EMBED, bias=config.bias),
-            nn.Linear(self.EMBED, self.EMBED * 2),  # Hidden layer 1
+            nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 1
             nn.GELU(),  # Activation function
-            # nn.Linear(self.EMBED * 2, self.EMBED),  # Hidden layer 2
-            # nn.GELU(),  # Activation function
-            nn.Linear(self.EMBED * 2, 1), # Output layer
+            nn.Linear(self.EMBED, self.EMBED),  # Hidden layer 2
+            nn.GELU(),  # Activation function
+            nn.Linear(self.EMBED, 1), # Output layer
         )
         self.expand = nn.Sequential(
             nn.LayerNorm(config.n_embd, bias=config.bias),
