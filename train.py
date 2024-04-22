@@ -232,9 +232,11 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, real_loss = model(X, Y)
             losses[k] = loss.item()
+            real_losses[k] = real_loss.item()
         out[split] = losses.mean()
+        out[f'{split}_real_loss'] = real_losses.mean()
     model.train()
     return out
 
@@ -276,7 +278,7 @@ while True:
         losses = estimate_loss()
         # print(f"Thinking budget threshold: {model.thinking_budget.threshold * 100:.2f}%")
         # print(f"Average thinking steps: {model.thinking_budget.avg_thinking_steps:.2f}")
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, val real loss {losses['val_real_loss']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -311,7 +313,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, real_loss = model(X, Y)
             # val_data = model(X_val, Y_val)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU

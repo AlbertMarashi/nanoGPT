@@ -190,8 +190,7 @@ class GPT(nn.Module):
             return self.thinking_block(x, targets)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            return logits, None
+            return  self.thinking_block(x[:, [-1], :])
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -230,7 +229,9 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
+
+            # print(f"logits.shape: {logits.shape}")
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -255,28 +256,34 @@ class ThinkingBlock(nn.Module):
         super().__init__()
         self.step_count = 0
         self.block = Block(config)
-        self.thinking_score = nn.Linear(config.n_embd, 1)  # Linear layer for thinking score
+        self.thinking_score = nn.Sequential(
+            nn.LayerNorm(config.n_embd, bias=config.bias),
+            nn.Linear(config.n_embd, 1),  # Linear layer for thinking score
+            # nn.LayerNorm(1, bias=config.bias),
+        )
         self.to_logits = nn.Sequential(
             nn.Linear(config.n_embd, config.vocab_size, bias=False),
             nn.LayerNorm(config.vocab_size, bias=config.bias),
         )
+        # self.threshold = nn.Parameter(torch.tensor(0.0, dtype=torch.float))
 
-    def forward(self, x, targets):
+    def forward(self, x, targets = None):
         if(self.training):
             self.step_count += 1
         B, T, C = x.shape
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
         thinking_steps = torch.zeros(B, T, dtype=torch.float, device=x.device)
         energy_loss = torch.tensor(0., device=x.device)
+        loss_improvements = torch.zeros(B, T, dtype=torch.float, device=x.device)
 
-        x = torch.where(update_mask.unsqueeze(-1), self.block(x), x)  # Initial update of x
+        x = self.block(x)
 
         for i in range(self.MAX_ITER):
             thinking_steps[update_mask] += 1
             thinking_scores = self.thinking_score(x).squeeze(-1)  # Calculate thinking scores
             x_logits = self.to_logits(x)
 
-            # score_1 = thinking_scores[0][0]
+            score_1 = thinking_scores[0][0]
             # print(f"score_1: {score_1:.4f}")
 
             if targets is not None:
@@ -284,38 +291,37 @@ class ThinkingBlock(nn.Module):
                 next_x_logits = self.to_logits(next_x)
                 x_losses = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
                 next_x_losses = F.cross_entropy(next_x_logits.view(-1, next_x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
-                loss_improvement = (x_losses - next_x_losses) * update_mask
+                loss_diff = x_losses - next_x_losses
+                loss_improvement = loss_diff * update_mask
 
-                # Reward and penalize based on thinking scores and loss improvement
+                # # Reward and penalize based on thinking scores and loss improvement
                 reward_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement > 0)
-                reward_mask_2 = update_mask & (thinking_scores <= self.THRESHOLD) & (loss_improvement <= 0)
+                reward_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement < 0)
                 penalty_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement <= 0)
-                penalty_mask_2 = update_mask & (thinking_scores <= self.THRESHOLD) & (loss_improvement > 0)
+                penalty_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement > 0)
                 reward = torch.sum(reward_mask_1.float()) + torch.sum(reward_mask_2.float())
                 penalty = torch.sum(penalty_mask_1.float()) + torch.sum(penalty_mask_2.float())
                 energy_loss += penalty - reward
 
                 # Ensure update_mask is set to True for tokens with improvement
-                update_mask = update_mask & (loss_improvement > 0)
+                # update_mask = update_mask & (loss_improvement > 0)
+                update_mask = update_mask & (thinking_scores > self.THRESHOLD)
 
-                # Reuse next_x as x for the next iteration
-                x = torch.where(update_mask.unsqueeze(-1), next_x, x)
-
-                if i == self.MIN_ITER - 1:
+                if i < self.MIN_ITER - 1:
                     # make it all true
                     update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+
+                # # Reuse next_x as x for the next iteration
+                x = torch.where(update_mask.unsqueeze(-1), next_x, x)
             else:
                 # During inference, use purely the thinking score to update the mask
                 update_mask = update_mask & (thinking_scores > self.THRESHOLD)
-                x = self.block(x)
+                x = torch.where(update_mask.unsqueeze(-1), self.block(x), x)
 
-            # Stop executing for tokens that cross the threshold
-            # update_mask = update_mask & (thinking_scores > self.THRESHOLD)
-
-        energy_loss = (energy_loss / thinking_steps.sum()) * 0.1
         if targets is not None:
-            x_losses = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
-            real_loss = x_losses.mean()
+            energy_loss = (energy_loss / thinking_steps.sum()) * 0.05
+            real_loss = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1)
+
             loss = real_loss + energy_loss
             if self.training and self.step_count % 10 == 0:
                 print(json.dumps({
@@ -325,9 +331,9 @@ class ThinkingBlock(nn.Module):
                     "energy_loss": f"{energy_loss.item():.4f}",
                     "avg_thinking_steps": f"{thinking_steps.mean().item():.2f}",
                 }))
-            return x_logits, loss
+            return x_logits, loss, real_loss
         else:
-            return x_logits, None
+            return x_logits, None, None
 
 # class ThinkingBlock(nn.Module):
 #     MAX_ITER = 1

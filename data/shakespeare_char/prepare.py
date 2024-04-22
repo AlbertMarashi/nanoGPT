@@ -11,7 +11,7 @@ import numpy as np
 import csv
 
 # download the tiny shakespeare dataset
-input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
+input_file_path = os.path.join(os.path.dirname(__file__), 'input_pile.txt')
 # if not os.path.exists(input_file_path):
 #     data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
 #     with open(input_file_path, 'w') as f:
@@ -26,6 +26,10 @@ data = data.encode('ascii', 'ignore').decode('ascii')
 
 # get the first 5m characters
 data = data[:5000000]
+
+# # write the data to a file
+# with open(input_file_path, 'w') as f:
+#     f.write(data)
 
 # trim any consecutive whitespace, by splitting into new lines and removing empty lines
 # data = '\n'.join([line.strip() for line in data.split('\n') if line.strip()])
