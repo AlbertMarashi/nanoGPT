@@ -248,9 +248,9 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 4
-    MIN_ITER = 2
-    THRESHOLD = 0.5  # Static threshold for thinking score
+    MAX_ITER = 3
+    MIN_ITER = 1
+    THRESHOLD = 0  # Static threshold for thinking score
 
     def __init__(self, config):
         super().__init__()
@@ -274,6 +274,7 @@ class ThinkingBlock(nn.Module):
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
         thinking_steps = torch.zeros(B, T, dtype=torch.float, device=x.device)
         energy_loss = torch.tensor(0., device=x.device)
+        corr_loss = torch.tensor(0., device=x.device)
         loss_improvements = torch.zeros(B, T, dtype=torch.float, device=x.device)
 
         x = self.block(x)
@@ -282,51 +283,69 @@ class ThinkingBlock(nn.Module):
             thinking_steps[update_mask] += 1
             thinking_scores = self.thinking_score(x).squeeze(-1)  # Calculate thinking scores
             x_logits = self.to_logits(x)
-
-            score_1 = thinking_scores[0][0]
-            # print(f"score_1: {score_1:.4f}")
+            next_x = self.block(x)  # Run the block again to get next_x
 
             if targets is not None:
-                next_x = self.block(x)  # Run the block again to get next_x
-                next_x_logits = self.to_logits(next_x)
                 x_losses = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
-                next_x_losses = F.cross_entropy(next_x_logits.view(-1, next_x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
-                loss_diff = x_losses - next_x_losses
-                loss_improvement = loss_diff * update_mask
 
-                # # Reward and penalize based on thinking scores and loss improvement
-                reward_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement > 0)
-                reward_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement < 0)
-                penalty_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement <= 0)
-                penalty_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement > 0)
-                reward = torch.sum(reward_mask_1.float()) + torch.sum(reward_mask_2.float())
-                penalty = torch.sum(penalty_mask_1.float()) + torch.sum(penalty_mask_2.float())
-                energy_loss += penalty - reward
+                # if the model is at max_iter, we don't want to do all these calculations
+                if i != self.MAX_ITER - 1:
+                    next_x_logits = self.to_logits(next_x)
+                    next_x_losses = F.cross_entropy(next_x_logits.view(-1, next_x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
 
-                # Ensure update_mask is set to True for tokens with improvement
-                # update_mask = update_mask & (loss_improvement > 0)
-                update_mask = update_mask & (thinking_scores > self.THRESHOLD)
+                    loss_diff = x_losses - next_x_losses
+                    loss_improvement = loss_diff * update_mask
 
-                if i < self.MIN_ITER - 1:
-                    # make it all true
-                    update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+                    score_diff = thinking_scores - self.THRESHOLD
+                    score_diff = torch.clamp(score_diff, min=-1.0, max=1.0)
 
-                # # Reuse next_x as x for the next iteration
-                x = torch.where(update_mask.unsqueeze(-1), next_x, x)
-            else:
-                # During inference, use purely the thinking score to update the mask
-                update_mask = update_mask & (thinking_scores > self.THRESHOLD)
-                x = torch.where(update_mask.unsqueeze(-1), self.block(x), x)
+                    # needed more thinking and actually did better with more thinking
+                    reward_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement > 0)
+                    # needed less thinking and actually did worse with more thinking
+                    reward_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement < 0)
+                    # needed more thinking and actually did worse with more thinking
+                    penalty_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement <= 0)
+                    # needed less thinking and actually did better with more thinking
+                    penalty_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement > 0)
+
+                    reward = torch.sum(reward_mask_1.float() * score_diff) + torch.sum(reward_mask_2.float() * -score_diff)
+                    penalty = torch.sum(penalty_mask_1.float() * score_diff) + torch.sum(penalty_mask_2.float() * -score_diff)
+
+                    # Calculate the correlation coefficient between thinking scores and loss improvement
+                    thinking_scores_masked = thinking_scores[update_mask]
+                    loss_improvement_masked = loss_improvement[update_mask]
+                    stacked = torch.stack((thinking_scores_masked, loss_improvement_masked), dim=0)
+                    correlation_coef = torch.corrcoef(stacked)[0, 1]
+
+                    # Adjust the energy loss based on the correlation coefficient
+                    corr_loss += -correlation_coef
+                    energy_loss += penalty - reward
+
+            update_mask = update_mask & (thinking_scores > self.THRESHOLD)
+
+            # make sure the update mask is set to True for at least self.MIN_ITER
+            if i < self.MIN_ITER - 1:
+                # make it all true
+                update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+
+            x = torch.where(update_mask.unsqueeze(-1), next_x, x)
+        # get the minimum thinking steps
+        # print(thinking_steps[0][0])
+        # min_thinking_steps = thinking_steps.min()
+        # max_thinking_steps = thinking_steps.max()
+        # print(f"min_thinking_steps: {min_thinking_steps}, max_thinking_steps: {max_thinking_steps}")
 
         if targets is not None:
-            energy_loss = (energy_loss / thinking_steps.sum()) * 1
-            real_loss = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1)
+            corr_loss = (corr_loss / thinking_steps.mean()) * 0.1
+            energy_loss = (energy_loss / thinking_steps.sum()) * 0.1
+            real_loss = x_losses.mean()
 
-            loss = real_loss + energy_loss
+            loss = real_loss + energy_loss + corr_loss
             if self.training and self.step_count % 10 == 0:
                 print(json.dumps({
                     "step": self.step_count,
                     "loss": f"{loss.item():.4f}",
+                    "corr_loss": f"{corr_loss.item():.4f}",
                     "real_loss": f"{real_loss.item():.4f}",
                     "energy_loss": f"{energy_loss.item():.4f}",
                     "avg_thinking_steps": f"{thinking_steps.mean().item():.2f}",
