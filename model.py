@@ -319,7 +319,7 @@ class ThinkingBlock(nn.Module):
                 x = torch.where(update_mask.unsqueeze(-1), self.block(x), x)
 
         if targets is not None:
-            energy_loss = (energy_loss / thinking_steps.sum()) * 0.05
+            energy_loss = (energy_loss / thinking_steps.sum()) * 1
             real_loss = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1)
 
             loss = real_loss + energy_loss
