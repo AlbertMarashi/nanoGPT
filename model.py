@@ -183,8 +183,8 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = tok_emb + pos_emb
         # x = self.transformer.drop(x)
-        # for block in self.transformer.h:
-        #     x = block(x)
+        for block in self.transformer.h:
+            x = block(x)
 
         if targets is not None:
             return self.thinking_block(x, targets)
@@ -248,9 +248,9 @@ class GPT(nn.Module):
         return idx
 
 class ThinkingBlock(nn.Module):
-    MAX_ITER = 3
+    MAX_ITER = 1
     MIN_ITER = 1
-    THRESHOLD = 0  # Static threshold for thinking score
+    # THRESHOLD = 0  # Static threshold for thinking score
 
     def __init__(self, config):
         super().__init__()
@@ -259,13 +259,11 @@ class ThinkingBlock(nn.Module):
         self.thinking_score = nn.Sequential(
             nn.LayerNorm(config.n_embd, bias=config.bias),
             nn.Linear(config.n_embd, 1),  # Linear layer for thinking score
-            # nn.LayerNorm(1, bias=config.bias),
         )
         self.to_logits = nn.Sequential(
             nn.Linear(config.n_embd, config.vocab_size, bias=False),
             nn.LayerNorm(config.vocab_size, bias=config.bias),
         )
-        # self.threshold = nn.Parameter(torch.tensor(0.0, dtype=torch.float))
 
     def forward(self, x, targets = None):
         if(self.training):
@@ -273,82 +271,74 @@ class ThinkingBlock(nn.Module):
         B, T, C = x.shape
         update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
         thinking_steps = torch.zeros(B, T, dtype=torch.float, device=x.device)
-        energy_loss = torch.tensor(0., device=x.device)
-        corr_loss = torch.tensor(0., device=x.device)
-        loss_improvements = torch.zeros(B, T, dtype=torch.float, device=x.device)
-
-        x = self.block(x)
+        energy_losses = torch.zeros(B, T, device=x.device)
 
         for i in range(self.MAX_ITER):
             thinking_steps[update_mask] += 1
+            x = torch.where(update_mask.unsqueeze(-1), self.block(x), x)
             thinking_scores = self.thinking_score(x).squeeze(-1)  # Calculate thinking scores
+            # print(f"thinking_scores: {thinking_scores.shape}, {thinking_scores}")
+            # thinking_scores = 2.0 * F.softmax(thinking_scores, dim=-1) - 1.0
             x_logits = self.to_logits(x)
-            next_x = self.block(x)  # Run the block again to get next_x
 
             if targets is not None:
                 x_losses = F.cross_entropy(x_logits.view(-1, x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
 
-                # if the model is at max_iter, we don't want to do all these calculations
-                if i != self.MAX_ITER - 1:
+                if i <= self.MAX_ITER and i >= self.MIN_ITER:
+                    # print("should never be called, i:", i)
+                    next_x = self.block(x)  # Run the block again to get next_x
                     next_x_logits = self.to_logits(next_x)
                     next_x_losses = F.cross_entropy(next_x_logits.view(-1, next_x_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none').view(B, T)
 
-                    loss_diff = x_losses - next_x_losses
-                    loss_improvement = loss_diff * update_mask
+                    loss_diffs = x_losses - next_x_losses
+                    # loss_improvement = loss_diff * update_mask
+                    loss_diffs_norm = 2.0 * F.softmax(loss_diffs, dim=-1) - 1.0
+                    thinking_scores_norm = 2.0 * F.softmax(thinking_scores, dim=-1) - 1.0
 
-                    score_diff = thinking_scores - self.THRESHOLD
-                    score_diff = torch.clamp(score_diff, min=-1.0, max=1.0)
+                    # # needed more thinking and actually did better with more thinking
+                    # reward_mask_1 = update_mask & (thinking_scores > 0) & (loss_improvement > 0)
+                    # # needed less thinking and actually did worse with more thinking
+                    # reward_mask_2 = update_mask & (thinking_scores < 0) & (loss_improvement < 0)
+                    # # needed more thinking and actually did worse with more thinking
+                    # penalty_mask_1 = update_mask & (thinking_scores > 0) & (loss_improvement < 0)
+                    # # needed less thinking and actually did better with more thinking
+                    # penalty_mask_2 = update_mask & (thinking_scores < 0) & (loss_improvement > 0)
 
-                    # needed more thinking and actually did better with more thinking
-                    reward_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement > 0)
-                    # needed less thinking and actually did worse with more thinking
-                    reward_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement < 0)
-                    # needed more thinking and actually did worse with more thinking
-                    penalty_mask_1 = update_mask & (thinking_scores > self.THRESHOLD) & (loss_improvement <= 0)
-                    # needed less thinking and actually did better with more thinking
-                    penalty_mask_2 = update_mask & (thinking_scores < self.THRESHOLD) & (loss_improvement > 0)
+                    # reward = torch.sum(reward_mask_1.float() * score_diff) + torch.sum(reward_mask_2.float() * -score_diff)
+                    # # penalty = 0
+                    # penalty = torch.sum(penalty_mask_1.float() * score_diff) + torch.sum(penalty_mask_2.float() * -score_diff)
+                    # energy_loss += penalty - reward
 
-                    reward = torch.sum(reward_mask_1.float() * score_diff) + torch.sum(reward_mask_2.float() * -score_diff)
-                    penalty = torch.sum(penalty_mask_1.float() * score_diff) + torch.sum(penalty_mask_2.float() * -score_diff)
+                    # Calculate the difference between thinking_scores_norm and loss_diffs_norm
+                    diff = thinking_scores_norm - loss_diffs_norm
 
-                    # Calculate the correlation coefficient between thinking scores and loss improvement
-                    thinking_scores_masked = thinking_scores[update_mask]
-                    loss_improvement_masked = loss_improvement[update_mask]
-                    stacked = torch.stack((thinking_scores_masked, loss_improvement_masked), dim=0)
-                    correlation_coef = torch.corrcoef(stacked)[0, 1]
+                    # energy_loss += torch.sum(diff * update_mask.float())
+                    energy_losses[update_mask] += diff[update_mask]
 
-                    # Adjust the energy loss based on the correlation coefficient
-                    corr_loss += -correlation_coef
-                    energy_loss += penalty - reward
-
-            update_mask = update_mask & (thinking_scores > self.THRESHOLD)
+            update_mask = update_mask & (thinking_scores > 0)
 
             # make sure the update mask is set to True for at least self.MIN_ITER
             if i < self.MIN_ITER - 1:
                 # make it all true
                 update_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
 
-            x = torch.where(update_mask.unsqueeze(-1), next_x, x)
-        # get the minimum thinking steps
-        # print(thinking_steps[0][0])
-        # min_thinking_steps = thinking_steps.min()
-        # max_thinking_steps = thinking_steps.max()
-        # print(f"min_thinking_steps: {min_thinking_steps}, max_thinking_steps: {max_thinking_steps}")
-
         if targets is not None:
-            corr_loss = (corr_loss / thinking_steps.mean()) * 0.1
-            energy_loss = (energy_loss / thinking_steps.sum()) * 0.1
+            # energy_loss = (energy_loss / thinking_steps.sum()) * 10
+            energy_loss = energy_losses.mean()
             real_loss = x_losses.mean()
 
-            loss = real_loss + energy_loss + corr_loss
+            loss = real_loss + energy_loss# + total_improvement / thinking_steps.sum()
             if self.training and self.step_count % 10 == 0:
+                for i in range(1, self.MAX_ITER + 1):
+                    # count all the tokens with n thinking steps
+                    count = (thinking_steps == i).sum()
+                    print(f"count_{i}: {count.item()}")
                 print(json.dumps({
                     "step": self.step_count,
                     "loss": f"{loss.item():.4f}",
-                    "corr_loss": f"{corr_loss.item():.4f}",
                     "real_loss": f"{real_loss.item():.4f}",
                     "energy_loss": f"{energy_loss.item():.4f}",
-                    "avg_thinking_steps": f"{thinking_steps.mean().item():.2f}",
+                    "avg_thinking_steps": f"{thinking_steps.sum() / (B * T):.2f}",
                 }))
             return x_logits, loss, real_loss
         else:
